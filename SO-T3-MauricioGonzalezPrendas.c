@@ -15,8 +15,8 @@
  *   gcc -Wall -Wextra -pedantic -std=c11 -D_GNU_SOURCE -pthread -O2 SO-T3-MauricioGonzalezPrendas.c -o SO-T3-MauricioGonzalezPrendas -pthread -lm
  *
  * Descripción general:
- *   Estructura base de Box Mr. Meeseeks con memoria compartida anónima,
- *   semáforos POSIX y bifurcación inicial del proceso raíz.
+ *   Canales de comunicación privada mediante pares de tuberías bidireccionales
+ *   y protocolo de mensajes MeeseeksMsg entre Box y los procesos subordinados.
  */
 
 #ifndef _GNU_SOURCE
@@ -36,6 +36,41 @@
 #include <errno.h>
 
 #define MAX_LINE_LEN 1024
+
+typedef enum {
+    TASK_CASE_A_SIMULATION = 1,
+    TASK_CASE_B_CALCULATION,
+    TASK_CASE_C_EXTERNAL_PROG
+} TaskType;
+
+typedef enum {
+    MSG_TASK_ASSIGN = 1,
+    MSG_TASK_SOLVED,
+    MSG_TASK_FAILED,
+    MSG_TERMINATE_ORDER,
+    MSG_FAREWELL_ACK
+} PipeMsgType;
+
+typedef struct {
+    PipeMsgType type;
+    TaskType task_type;
+    int solver_pid;
+    int solver_ppid;
+    int solver_level;
+    int solver_instance;
+    double final_difficulty;
+    double sim_duration;
+    char text[512];
+    double result_value;
+    bool has_error;
+} MeeseeksMsg;
+
+typedef struct {
+    int to_child[2];
+    int to_parent[2];
+    pid_t pid;
+    int instance;
+} ChildPipe;
 
 typedef struct {
     sem_t mutex;
@@ -95,6 +130,41 @@ static void shm_register_meeseeks_birth(int level) {
     sem_post(&g_shm->mutex);
 }
 
+static void run_meeseeks_process(int level, int instance, int read_from_parent_fd, int write_to_parent_fd) {
+    shm_register_meeseeks_birth(level);
+    printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%d, %d, %d, %d)\n",
+           getpid(), getppid(), level, instance);
+    fflush(stdout);
+
+    MeeseeksMsg assign_msg;
+    memset(&assign_msg, 0, sizeof(assign_msg));
+    ssize_t n = read(read_from_parent_fd, &assign_msg, sizeof(assign_msg));
+    if (n <= 0) {
+        close(read_from_parent_fd);
+        close(write_to_parent_fd);
+        _exit(1);
+    }
+
+    sleep(1);
+
+    MeeseeksMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.type = MSG_TASK_SOLVED;
+    resp.solver_pid = getpid();
+    resp.solver_ppid = getppid();
+    resp.solver_level = level;
+    resp.solver_instance = instance;
+
+    write(write_to_parent_fd, &resp, sizeof(resp));
+    printf("[Meeseeks %d, nivel %d, instancia %d]: Tarea completada. Desapareciendo con un ¡POOF!\n",
+           getpid(), level, instance);
+    fflush(stdout);
+
+    close(read_from_parent_fd);
+    close(write_to_parent_fd);
+    _exit(0);
+}
+
 int main(void) {
     if (!init_shared_memory()) {
         fprintf(stderr, "Fallo al inicializar memoria compartida.\n");
@@ -115,19 +185,45 @@ int main(void) {
         if (strlen(line) == 0) continue;
         if (strcmp(line, "adios") == 0 || strcmp(line, "salir") == 0) break;
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("Error al crear Mr. Meeseeks");
+        int box_to_root[2];
+        int root_to_box[2];
+        if (pipe(box_to_root) < 0 || pipe(root_to_box) < 0) {
+            perror("Error al crear tuberías");
             continue;
         }
-        if (pid == 0) {
-            shm_register_meeseeks_birth(1);
-            printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%d, %d, 1, 1)\n", getpid(), getppid());
-            sleep(1);
-            printf("[Meeseeks %d, nivel 1, instancia 1]: Tarea completada. Desapareciendo con un ¡POOF!\n", getpid());
-            _exit(0);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("Error en fork");
+            close(box_to_root[0]); close(box_to_root[1]);
+            close(root_to_box[0]); close(root_to_box[1]);
+            continue;
         }
+
+        if (pid == 0) {
+            close(box_to_root[1]);
+            close(root_to_box[0]);
+            run_meeseeks_process(1, 1, box_to_root[0], root_to_box[1]);
+        }
+
+        close(box_to_root[0]);
+        close(root_to_box[1]);
+
+        MeeseeksMsg task_msg;
+        memset(&task_msg, 0, sizeof(task_msg));
+        task_msg.type = MSG_TASK_ASSIGN;
+        task_msg.task_type = TASK_CASE_A_SIMULATION;
+        snprintf(task_msg.text, sizeof(task_msg.text), "%s", line);
+        write(box_to_root[1], &task_msg, sizeof(task_msg));
+
+        MeeseeksMsg reply;
+        memset(&reply, 0, sizeof(reply));
+        read(root_to_box[0], &reply, sizeof(reply));
         waitpid(pid, NULL, 0);
+
+        close(box_to_root[1]);
+        close(root_to_box[0]);
+        printf("[Box]: Solicitud procesada vía tuberías privadas.\n\n");
     }
 
     cleanup_shared_memory();
